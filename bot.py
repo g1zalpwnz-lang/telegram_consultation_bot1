@@ -1,58 +1,97 @@
 import os
-import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
+import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# Настройки из environment variables
-TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
-ADMIN_CHAT_ID = int(os.environ['ADMIN_CHAT_ID'])
-GOOGLE_CALENDAR_ID = os.environ['GOOGLE_CALENDAR_ID']
+# ====== НАСТРОЙКИ ======
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID"))  # 617492
+CALENDAR_ID = os.environ.get("CALENDAR_ID")  # Например, bot-calendar@exalted-etching-485813-r4.iam.gserviceaccount.com
+SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # Полный JSON в одну строку
+TIMEZONE = "Europe/Moscow"
+WORK_START = 9
+WORK_END = 16
+SLOT_INTERVAL_MINUTES = 30
+NUM_DAYS = 5  # ближайшие рабочие дни
 
-# Загружаем сервисный аккаунт
-service_account_str = os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']
-service_account_json = json.loads(service_account_str)
-service_account_json['private_key'] = service_account_json['private_key'].replace('\\n', '\n')
-
-# Создаем credentials и сервис календаря
+# ====== GOOGLE CALENDAR ======
 credentials = service_account.Credentials.from_service_account_info(
-    service_account_json,
+    eval(SERVICE_ACCOUNT_JSON),  # преобразуем из строки в dict
     scopes=["https://www.googleapis.com/auth/calendar"]
 )
-calendar_service = build('calendar', 'v3', credentials=credentials)
+service = build("calendar", "v3", credentials=credentials)
 
-# Слоты
-slots = [f"{h}:00" for h in range(9, 17)]  # 9:00 - 16:00
+# ====== ФУНКЦИИ ======
+def get_next_working_days(n):
+    days = []
+    current = datetime.now(pytz.timezone(TIMEZONE))
+    while len(days) < n:
+        if current.weekday() < 5:  # 0-4 -> Пн-Пт
+            days.append(current)
+        current += timedelta(days=1)
+    return days
 
+def generate_time_slots():
+    slots = []
+    current = time(WORK_START, 0)
+    while current <= time(WORK_END, 30):
+        slots.append(current.strftime("%H:%M"))
+        current = (datetime.combine(datetime.today(), current) + timedelta(minutes=SLOT_INTERVAL_MINUTES)).time()
+    return slots
+
+def format_date(dt):
+    return dt.strftime("%d.%m")
+
+# ====== ХЭНДЛЕРЫ ======
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [[InlineKeyboardButton(s, callback_data=s)] for s in slots]
+    keyboard = [
+        [InlineKeyboardButton(format_date(day), callback_data=f"date|{day.date()}")]
+        for day in get_next_working_days(NUM_DAYS)
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text('Выберите время для консультации:', reply_markup=reply_markup)
+    await update.message.reply_text("Выберите дату для консультации:", reply_markup=reply_markup)
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    slot = query.data
-    user = query.from_user
-    await query.edit_message_text(text=f"Вы записаны на {slot}")
+    data = query.data
 
-    # Уведомление администратору
-    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"{user.full_name} записался на {slot}")
+    if data.startswith("date|"):
+        selected_date = data.split("|")[1]
+        slots = generate_time_slots()
+        keyboard = [
+            [InlineKeyboardButton(slot, callback_data=f"time|{selected_date}|{slot}")]
+            for slot in slots
+        ]
+        await query.edit_message_text(
+            text=f"Вы выбрали дату {selected_date}. Выберите время:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
-    # Добавление события в Google Calendar
-    start_time = datetime.now().replace(hour=int(slot.split(":")[0]), minute=0, second=0)
-    event = {
-        'summary': f'Консультация с {user.full_name}',
-        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Europe/Moscow'},
-        'end': {'dateTime': (start_time + timedelta(minutes=30)).isoformat(), 'timeZone': 'Europe/Moscow'},
-    }
-    calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+    elif data.startswith("time|"):
+        _, selected_date, selected_time = data.split("|")
+        dt = datetime.strptime(f"{selected_date} {selected_time}", "%Y-%m-%d %H:%M")
+        dt = pytz.timezone(TIMEZONE).localize(dt)
 
+        # Создание события в календаре
+        event = {
+            "summary": "Консультация",
+            "start": {"dateTime": dt.isoformat(), "timeZone": TIMEZONE},
+            "end": {"dateTime": (dt + timedelta(minutes=SLOT_INTERVAL_MINUTES)).isoformat(), "timeZone": TIMEZONE},
+        }
+        service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
+
+        # Уведомление клиента
+        await query.edit_message_text(f"Вы записаны на {selected_date} в {selected_time}!")
+
+        # Уведомление админа
+        await context.bot.send_message(ADMIN_CHAT_ID, f"Новая запись: {selected_date} в {selected_time}")
+
+# ====== ИНИЦИАЛИЗАЦИЯ БОТА ======
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button))
-
-print("Бот запущен!")
 app.run_polling()
