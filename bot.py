@@ -1,153 +1,93 @@
 import os
 import json
-import sqlite3
-import datetime
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-)
+import logging
+from datetime import datetime, timedelta
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ================= Настройки =================
-TOKEN = os.environ["TOKEN"]  # Telegram токен
-DB_PATH = "slots.db"
-ADMIN_CHAT_ID = int(os.environ["ADMIN_CHAT_ID"])  # твой Telegram ID
+# ===== Настройка логирования =====
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Google Calendar
-SCOPES = ['https://www.googleapis.com/auth/calendar']
-CALENDAR_ID = os.environ["CALENDAR_ID"]  # email календаря
+# ===== Telegram =====
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+
+# ===== Google Calendar =====
 SERVICE_ACCOUNT_JSON = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+CALENDAR_ID = "bot-calendar@exalted-etching-485813-r4.iam.gserviceaccount.com"
 
 credentials = service_account.Credentials.from_service_account_info(
-    SERVICE_ACCOUNT_JSON, scopes=SCOPES
+    SERVICE_ACCOUNT_JSON,
+    scopes=["https://www.googleapis.com/auth/calendar"]
 )
-calendar_service = build('calendar', 'v3', credentials=credentials)
 
-# ================= Генерация слотов =================
-WORK_HOURS_START = 9
-WORK_HOURS_END = 16
-SLOT_DURATION = 30
-DAYS_AHEAD = 14  # на 2 недели вперед
+calendar_service = build("calendar", "v3", credentials=credentials)
 
-def create_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS slots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT,
-            time TEXT,
-            available INTEGER DEFAULT 1,
-            client_name TEXT,
-            client_chat_id INTEGER
-        )
-    """)
-    conn.commit()
-    conn.close()
-
+# ===== Генерация слотов =====
 def generate_slots():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    today = datetime.date.today()
+    slots = []
+    start_hour = 9
+    end_hour = 16
+    duration_minutes = 30
 
-    for day_offset in range(DAYS_AHEAD):
-        date = today + datetime.timedelta(days=day_offset)
-        if date.weekday() >= 5:  # пропускаем субботу и воскресенье
-            continue
-        for hour in range(WORK_HOURS_START, WORK_HOURS_END):
-            for minute in [0, 30]:
-                time_str = f"{hour:02d}:{minute:02d}"
-                c.execute(
-                    "INSERT INTO slots (date, time, available) VALUES (?, ?, 1)",
-                    (date.isoformat(), time_str)
-                )
+    now = datetime.now()
+    for day_offset in range(5):  # ближайшие 5 рабочих дней
+        day = now + timedelta(days=day_offset)
+        if day.weekday() >= 5:
+            continue  # пропускаем выходные
+        for hour in range(start_hour, end_hour):
+            slots.append(datetime(day.year, day.month, day.day, hour, 0))
+            slots.append(datetime(day.year, day.month, day.day, hour, 30))
+    return slots
 
-    conn.commit()
-    conn.close()
-    print("Слоты сгенерированы!")
+available_slots = generate_slots()
 
-# ================= Google Calendar =================
-def add_event_to_calendar(client_name, date, time):
-    start_dt = datetime.datetime.fromisoformat(f"{date}T{time}:00")
-    end_dt = start_dt + datetime.timedelta(minutes=SLOT_DURATION)
+# ===== Добавление события в календарь =====
+def add_event_to_calendar(summary, start_time, end_time):
     event = {
-        'summary': f'Консультация: {client_name}',
-        'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Europe/Moscow'},
-        'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Europe/Moscow'},
+        "summary": summary,
+        "start": {"dateTime": start_time.isoformat(), "timeZone": "Europe/Moscow"},
+        "end": {"dateTime": end_time.isoformat(), "timeZone": "Europe/Moscow"},
     }
     calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
 
-# ================= Бот =================
-async def start(update, context):
-    await update.message.reply_text("Привет! Запишитесь на консультацию. Выберите дату:")
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT DISTINCT date FROM slots WHERE available=1 ORDER BY date")
-    dates = c.fetchall()
-    conn.close()
-
-    keyboard = [[InlineKeyboardButton(date[0], callback_data=f"date_{date[0]}")] for date in dates]
+# ===== Команды Telegram =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton(slot.strftime("%d.%m %H:%M"), callback_data=str(i))]
+        for i, slot in enumerate(available_slots[:10])  # показываем 10 ближайших слотов
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите дату:", reply_markup=reply_markup)
+    await update.message.reply_text("Выберите слот для консультации:", reply_markup=reply_markup)
 
-async def button(update, context):
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    slot_index = int(query.data)
+    slot_time = available_slots.pop(slot_index)
 
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    # Добавляем событие в календарь
+    add_event_to_calendar("Консультация", slot_time, slot_time + timedelta(minutes=30))
 
-    if data.startswith("date_"):
-        date = data.split("_")[1]
-        c.execute("SELECT id, time FROM slots WHERE date=? AND available=1 ORDER BY time", (date,))
-        slots = c.fetchall()
-        keyboard = [[InlineKeyboardButton(slot[1], callback_data=f"slot_{slot[0]}")] for slot in slots]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(f"Доступные слоты на {date}:", reply_markup=reply_markup)
+    # Отправляем уведомление в Telegram
+    await context.bot.send_message(
+        chat_id=TELEGRAM_CHAT_ID,
+        text=f"Новая запись на консультацию: {slot_time.strftime('%d.%m %H:%M')}"
+    )
+    await query.edit_message_text(f"Вы записаны на консультацию: {slot_time.strftime('%d.%m %H:%M')}")
 
-    elif data.startswith("slot_"):
-        slot_id = int(data.split("_")[1])
-        c.execute("SELECT date, time, available FROM slots WHERE id=?", (slot_id,))
-        slot = c.fetchone()
-        if slot[2] == 0:
-            await query.edit_message_text("Этот слот уже занят, выберите другой.")
-            conn.close()
-            return
-
-        # Бронируем слот
-        c.execute(
-            "UPDATE slots SET available=0, client_name=?, client_chat_id=? WHERE id=?",
-            (query.from_user.full_name, query.from_user.id, slot_id)
-        )
-        conn.commit()
-
-        # Добавляем событие в Google Calendar
-        add_event_to_calendar(query.from_user.full_name, slot[0], slot[1])
-
-        # Уведомление админа
-        if ADMIN_CHAT_ID:
-            await context.bot.send_message(
-                chat_id=ADMIN_CHAT_ID,
-                text=f"Новая запись: {query.from_user.full_name}, {slot[0]} {slot[1]}"
-            )
-
-        await query.edit_message_text(f"Вы успешно записаны на {slot[0]} в {slot[1]}.\nДо встречи!")
-
-    conn.close()
-
-# ================= Запуск =================
+# ===== Запуск бота =====
 if __name__ == "__main__":
-    create_db()
-    generate_slots()
-
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
-
     print("Бот запущен!")
     app.run_polling()
