@@ -1,122 +1,54 @@
 import os
 import json
 from datetime import datetime, timedelta
-import sqlite3
-
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, ContextTypes
-
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# --------------------------
-# ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# --------------------------
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ADMIN_ID = int(os.environ.get("TELEGRAM_ADMIN_ID"))
-GOOGLE_SERVICE_ACCOUNT_JSON = json.loads(os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"))
-GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID")
+# Получаем переменные окружения из Railway
+TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
+ADMIN_CHAT_ID = int(os.environ['ADMIN_CHAT_ID'])
+GOOGLE_CALENDAR_ID = os.environ['GOOGLE_CALENDAR_ID']
+SERVICE_ACCOUNT_JSON = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'])
 
-# --------------------------
-# ИНИЦИАЛИЗАЦИЯ GOOGLE CALENDAR
-# --------------------------
+# Инициализация Google Calendar API
 credentials = service_account.Credentials.from_service_account_info(
-    GOOGLE_SERVICE_ACCOUNT_JSON,
+    SERVICE_ACCOUNT_JSON,
     scopes=["https://www.googleapis.com/auth/calendar"]
 )
 calendar_service = build('calendar', 'v3', credentials=credentials)
 
-# --------------------------
-# ИНИЦИАЛИЗАЦИЯ SQLITE
-# --------------------------
-conn = sqlite3.connect('slots.db', check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS bookings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    start TEXT,
-    end TEXT
-)
-''')
-conn.commit()
-
-# --------------------------
-# СЛОТЫ
-# --------------------------
-SLOTS = []
-WORK_HOURS_START = 9
-WORK_HOURS_END = 16
-SLOT_DURATION = 30  # минут
-
-today = datetime.now()
-for hour in range(WORK_HOURS_START, WORK_HOURS_END):
-    for minute in [0, 30]:
-        start = today.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if start > today:
-            end = start + timedelta(minutes=SLOT_DURATION)
-            SLOTS.append((start, end))
-
-# --------------------------
-# GOOGLE CALENDAR ФУНКЦИЯ
-# --------------------------
-def add_event_to_calendar(title, start, end):
-    event = {
-        'summary': title,
-        'start': {'dateTime': start.isoformat(), 'timeZone': 'Europe/Moscow'},
-        'end': {'dateTime': end.isoformat(), 'timeZone': 'Europe/Moscow'},
-    }
-    calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-
-# --------------------------
-# ФУНКЦИИ TELEGRAM
-# --------------------------
-def build_keyboard():
-    keyboard = []
-    for idx, (start, end) in enumerate(SLOTS):
-        cursor.execute('SELECT * FROM bookings WHERE start=?', (start.isoformat(),))
-        if cursor.fetchone():
-            continue  # слот уже занят
-        button = InlineKeyboardButton(f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}", callback_data=str(idx))
-        keyboard.append([button])
-    return InlineKeyboardMarkup(keyboard)
+# Слоты
+slots = [f"{h}:00" for h in range(9, 17)]  # 9:00 - 16:00
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Выберите слот:", reply_markup=build_keyboard())
+    keyboard = [[InlineKeyboardButton(s, callback_data=s)] for s in slots]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('Выберите время для консультации:', reply_markup=reply_markup)
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    slot_index = int(query.data)
-    start, end = SLOTS[slot_index]
-
-    # Проверка, свободен ли слот
-    cursor.execute('SELECT * FROM bookings WHERE start=?', (start.isoformat(),))
-    if cursor.fetchone():
-        await query.edit_message_text("Извините, этот слот уже занят.")
-        return
-
-    # Добавляем в БД
-    cursor.execute('INSERT INTO bookings (start, end) VALUES (?, ?)', (start.isoformat(), end.isoformat()))
-    conn.commit()
-
-    # Добавляем событие в Google Calendar
-    add_event_to_calendar("Консультация", start, end)
-
-    # Сообщение клиенту
-    await query.edit_message_text(f"Вы записаны на {start.strftime('%d.%m %H:%M')}")
+    slot = query.data
+    user = query.from_user
+    await query.edit_message_text(text=f"Вы записаны на {slot}")
 
     # Уведомление администратору
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"Новый клиент записался на {start.strftime('%d.%m %H:%M')}"
-    )
+    await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"{user.full_name} записался на {slot}")
 
-# --------------------------
-# ЗАПУСК БОТА
-# --------------------------
-if __name__ == "__main__":
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CallbackQueryHandler(button))
-    application.add_handler(application.command_handler("start", start))
-    print("Слоты сгенерированы!")
-    application.run_polling()
+    # Добавление события в Google Calendar
+    start_time = datetime.now().replace(hour=int(slot.split(":")[0]), minute=0, second=0)
+    event = {
+        'summary': f'Консультация с {user.full_name}',
+        'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Europe/Moscow'},
+        'end': {'dateTime': (start_time + timedelta(minutes=30)).isoformat(), 'timeZone': 'Europe/Moscow'},
+    }
+    calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+
+app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(button))
+
+print("Бот запущен!")
+app.run_polling()
