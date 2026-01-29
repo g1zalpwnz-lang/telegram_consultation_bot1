@@ -1,97 +1,119 @@
 import os
-from datetime import datetime, timedelta, time
+import json
+import logging
+from datetime import datetime, timedelta
 import pytz
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# ====== НАСТРОЙКИ ======
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID"))  # 617492
-CALENDAR_ID = os.environ.get("CALENDAR_ID")  # Например, bot-calendar@exalted-etching-485813-r4.iam.gserviceaccount.com
-SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")  # Полный JSON в одну строку
-TIMEZONE = "Europe/Moscow"
-WORK_START = 9
-WORK_END = 16
-SLOT_INTERVAL_MINUTES = 30
-NUM_DAYS = 5  # ближайшие рабочие дни
+# Включаем логирование
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# ====== GOOGLE CALENDAR ======
+# Задаём переменные окружения в Railway
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "617492"))
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+# Загружаем сервисный аккаунт
+SERVICE_ACCOUNT_INFO = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
 credentials = service_account.Credentials.from_service_account_info(
-    eval(SERVICE_ACCOUNT_JSON),  # преобразуем из строки в dict
+    SERVICE_ACCOUNT_INFO,
     scopes=["https://www.googleapis.com/auth/calendar"]
 )
+
+CALENDAR_ID = os.getenv("CALENDAR_ID")  # сюда нужно вставить id календаря
+
 service = build("calendar", "v3", credentials=credentials)
 
-# ====== ФУНКЦИИ ======
-def get_next_working_days(n):
+MOSCOW_TZ = pytz.timezone("Europe/Moscow")
+
+# --- Вспомогательные функции ---
+def get_next_working_days(n=5):
+    today = datetime.now(MOSCOW_TZ)
     days = []
-    current = datetime.now(pytz.timezone(TIMEZONE))
+    delta = 0
     while len(days) < n:
-        if current.weekday() < 5:  # 0-4 -> Пн-Пт
-            days.append(current)
-        current += timedelta(days=1)
+        day = today + timedelta(days=delta)
+        if day.weekday() < 5:  # 0-4 = понедельник-пятница
+            days.append(day)
+        delta += 1
     return days
 
 def generate_time_slots():
+    """Слоты каждые 30 минут с 9:00 до 16:00"""
     slots = []
-    current = time(WORK_START, 0)
-    while current <= time(WORK_END, 30):
-        slots.append(current.strftime("%H:%M"))
-        current = (datetime.combine(datetime.today(), current) + timedelta(minutes=SLOT_INTERVAL_MINUTES)).time()
+    for hour in range(9, 17):
+        slots.append(f"{hour:02d}:00")
+        slots.append(f"{hour:02d}:30")
     return slots
 
-def format_date(dt):
-    return dt.strftime("%d.%m")
+def build_days_keyboard():
+    buttons = []
+    for day in get_next_working_days():
+        day_str = day.strftime("%d.%m")
+        buttons.append([InlineKeyboardButton(day_str, callback_data=day_str)])
+    return InlineKeyboardMarkup(buttons)
 
-# ====== ХЭНДЛЕРЫ ======
+def build_slots_keyboard(day_str):
+    buttons = []
+    for slot in generate_time_slots():
+        buttons.append([InlineKeyboardButton(slot, callback_data=f"{day_str} {slot}")])
+    return InlineKeyboardMarkup(buttons)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton(format_date(day), callback_data=f"date|{day.date()}")]
-        for day in get_next_working_days(NUM_DAYS)
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Выберите дату для консультации:", reply_markup=reply_markup)
+    await update.message.reply_text(
+        "Выберите дату для консультации:",
+        reply_markup=build_days_keyboard()
+    )
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
 
-    if data.startswith("date|"):
-        selected_date = data.split("|")[1]
-        slots = generate_time_slots()
-        keyboard = [
-            [InlineKeyboardButton(slot, callback_data=f"time|{selected_date}|{slot}")]
-            for slot in slots
-        ]
+    # Если выбрана дата
+    if len(data) == 5 and data[2] == '.':  # формат дд.мм
+        day_str = data
         await query.edit_message_text(
-            text=f"Вы выбрали дату {selected_date}. Выберите время:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            text=f"Выберите время для {day_str}:",
+            reply_markup=build_slots_keyboard(day_str)
         )
+    else:  # выбрано время
+        day_str, time_str = data.split()
+        user_name = query.from_user.full_name
+        event_start = datetime.strptime(f"{day_str}.{datetime.now().year} {time_str}", "%d.%m.%Y %H:%M")
+        event_start = MOSCOW_TZ.localize(event_start)
+        event_end = event_start + timedelta(minutes=30)
 
-    elif data.startswith("time|"):
-        _, selected_date, selected_time = data.split("|")
-        dt = datetime.strptime(f"{selected_date} {selected_time}", "%Y-%m-%d %H:%M")
-        dt = pytz.timezone(TIMEZONE).localize(dt)
-
-        # Создание события в календаре
         event = {
-            "summary": "Консультация",
-            "start": {"dateTime": dt.isoformat(), "timeZone": TIMEZONE},
-            "end": {"dateTime": (dt + timedelta(minutes=SLOT_INTERVAL_MINUTES)).isoformat(), "timeZone": TIMEZONE},
+            "summary": f"Консультация с {user_name}",
+            "start": {"dateTime": event_start.isoformat(), "timeZone": "Europe/Moscow"},
+            "end": {"dateTime": event_end.isoformat(), "timeZone": "Europe/Moscow"},
         }
+
         service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
 
-        # Уведомление клиента
-        await query.edit_message_text(f"Вы записаны на {selected_date} в {selected_time}!")
+        await query.edit_message_text(
+            text=f"Запись подтверждена: {day_str} {time_str}"
+        )
 
-        # Уведомление админа
-        await context.bot.send_message(ADMIN_CHAT_ID, f"Новая запись: {selected_date} в {selected_time}")
+        # Отправляем уведомление админу
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"Новая запись: {user_name}, {day_str} {time_str}"
+        )
 
-# ====== ИНИЦИАЛИЗАЦИЯ БОТА ======
+# --- Запуск бота ---
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button))
+
+print("Бот запущен...")
 app.run_polling()
