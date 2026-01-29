@@ -6,15 +6,19 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# Получаем переменные окружения из Railway
+# Настройки из environment variables
 TELEGRAM_TOKEN = os.environ['TELEGRAM_TOKEN']
 ADMIN_CHAT_ID = int(os.environ['ADMIN_CHAT_ID'])
 GOOGLE_CALENDAR_ID = os.environ['GOOGLE_CALENDAR_ID']
-SERVICE_ACCOUNT_JSON = json.loads(os.environ['GOOGLE_SERVICE_ACCOUNT_JSON'])
 
-# Инициализация Google Calendar API
+# Загружаем сервисный аккаунт
+service_account_str = os.environ['GOOGLE_SERVICE_ACCOUNT_JSON']
+service_account_json = json.loads(service_account_str)
+service_account_json['private_key'] = service_account_json['private_key'].replace('\\n', '\n')
+
+# Создаем credentials и сервис календаря
 credentials = service_account.Credentials.from_service_account_info(
-    SERVICE_ACCOUNT_JSON,
+    service_account_json,
     scopes=["https://www.googleapis.com/auth/calendar"]
 )
 calendar_service = build('calendar', 'v3', credentials=credentials)
